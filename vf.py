@@ -1,7 +1,7 @@
 import os
 import sys
 import time
-import ctypes
+import getpass
 from datetime import datetime
 
 from playwright.sync_api import sync_playwright
@@ -10,6 +10,8 @@ from playwright.sync_api import sync_playwright
 DEBUG = "--debug" in sys.argv
 
 CPU_PRINT_THRESHOLD = 30.0
+SUSTAIN_CPU_THRESHOLD = 30.0
+SUSTAIN_HIT_COUNT = 10      # 连续 a 次
 TAB_BATCH_SIZE = 5
 MAX_SUSTAIN_TABS = 20
 
@@ -22,24 +24,25 @@ SUSTAIN_EXIT_SEC = 30 * 60
 
 WATCHDOG_TIMEOUT = 120  # 秒
 
-warn_count = {}
+# ================= 登录信息 =================
+VF_EMAIL = input("VirtFusion Email: ")
+VF_PASSWORD = getpass.getpass("VirtFusion Password: ")
 
 # ================= 配置 =================
 BASE_URL = "https://vf.ciallo.ee"
 SERVERS_URL = f"{BASE_URL}/admin/servers"
 LOG_ROOT = "logs"
 
-EMA_TARGET_HOURS = 24
-EMA_N = int((EMA_TARGET_HOURS * 3600) / POLL_INTERVAL)
-EMA_ALPHA = 2 / (EMA_N + 1)
-
 # ================= 状态 =================
+warn_count = {}
 cpu_ema = {}
-sustain_since = {}
-sustain_tabs = {}
 
-running = True
+high_cpu_hits = {}     # sid -> 连续命中次数
+sustain_since = {}    # sid -> 时间戳
+sustain_tabs = {}     # sid -> page
+
 last_success_ts = time.time()
+running = True
 
 # ================= 工具 =================
 def ensure_dir(p):
@@ -72,18 +75,25 @@ def maybe_print(sid, cpu):
         print(f"[{ts}] SID={sid} CPU={color_cpu(cpu)}")
 
 # ================= 登录 =================
-def wait_for_login(page):
-    print("[*] 请手动登录 Virtfusion")
+def auto_login(page):
+    print("[*] 自动登录 VirtFusion")
     page.goto(BASE_URL)
-    page.wait_for_url("**/admin/dashboard", timeout=0)
-    print("[+] 登录完成")
 
-    # 最小化窗口，避免抢焦点
-    try:
-        hwnd = ctypes.windll.user32.GetForegroundWindow()
-        ctypes.windll.user32.ShowWindow(hwnd, 6)
-    except:
-        pass
+    page.wait_for_selector("input[type='email']")
+    page.fill("input[type='email']", VF_EMAIL)
+    page.fill("input[type='password']", VF_PASSWORD)
+
+    page.wait_for_function(
+        """() => {
+            const btn = document.querySelector("button.btn-primary");
+            return btn && !btn.disabled;
+        }""",
+        timeout=10_000
+    )
+
+    page.click("button.btn-primary")
+    page.wait_for_url("**/admin/dashboard", timeout=30_000)
+    print("[+] 登录成功")
 
 # ================= 翻页抓 ID =================
 def get_all_server_ids(page):
@@ -134,10 +144,7 @@ def get_all_server_ids(page):
 def fetch_cpu(page, sid):
     global last_success_ts
     try:
-        page.wait_for_selector(
-            "#cpuGauge text.value-text",
-            timeout=15_000
-        )
+        page.wait_for_selector("#cpuGauge text.value-text", timeout=15_000)
         txt = page.text_content("#cpuGauge text.value-text")
         cpu = float(txt.replace("%", "").strip())
         last_success_ts = time.time()
@@ -148,41 +155,42 @@ def fetch_cpu(page, sid):
 
 # ================= 主循环 =================
 def main():
-    global running, last_success_ts
+    global last_success_ts
 
     ensure_dir(LOG_ROOT)
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
-            headless=False,
-            args=["--disable-backgrounding-occluded-windows"]
+            headless=True,
+            args=[
+                "--disable-gpu",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-backgrounding-occluded-windows"
+            ]
         )
+
         ctx = browser.new_context()
-        ctx.add_init_script(
-            "Object.defineProperty(document,'visibilityState',{value:'visible'})"
-        )
-
         page = ctx.new_page()
-        wait_for_login(page)
 
+        auto_login(page)
         ids = get_all_server_ids(page)
         last_server_refresh_ts = time.time()
 
         print("[*] 开始监控（Ctrl+C 退出）")
 
         try:
-            while running:
+            while True:
                 now = time.time()
 
                 # ===== Watchdog =====
                 if now - last_success_ts > WATCHDOG_TIMEOUT:
-                    print("[WATCHDOG] 长时间无数据，重启浏览器")
+                    print("[WATCHDOG] 浏览器假死，重启")
                     browser.close()
                     return main()
 
                 # ===== 刷新服务器列表 =====
                 if now - last_server_refresh_ts >= SERVER_REFRESH_INTERVAL:
-                    print("[*] 刷新服务器列表中 …")
                     ids = get_all_server_ids(page)
                     last_server_refresh_ts = now
 
@@ -208,23 +216,36 @@ def main():
                     for sid, p in pages.items():
                         cpu = fetch_cpu(p, sid)
                         if cpu is None:
+                            p.close()
                             continue
-
-                        prev = cpu_ema.get(sid, cpu)
-                        cpu_ema[sid] = EMA_ALPHA * cpu + (1 - EMA_ALPHA) * prev
 
                         log_cpu(sid, cpu)
                         maybe_print(sid, cpu)
 
-                        if cpu > 30:
-                            sustain_since.setdefault(sid, now)
-                            if now - sustain_since[sid] >= SUSTAIN_ENTER_SEC:
-                                if len(sustain_tabs) < MAX_SUSTAIN_TABS:
-                                    sustain_tabs[sid] = p
-                                    print(f"[SUSTAIN] SID={sid} 进入持续监控")
-                                    continue
+                        # ===== sustain 判定 =====
+                        if cpu >= SUSTAIN_CPU_THRESHOLD:
+                            high_cpu_hits[sid] = high_cpu_hits.get(sid, 0) + 1
                         else:
+                            high_cpu_hits.pop(sid, None)
                             sustain_since.pop(sid, None)
+
+                        hit_ok = high_cpu_hits.get(sid, 0) >= SUSTAIN_HIT_COUNT
+                        if hit_ok:
+                            sustain_since.setdefault(sid, now)
+
+                        time_ok = (
+                            sid in sustain_since and
+                            now - sustain_since[sid] >= SUSTAIN_ENTER_SEC
+                        )
+
+                        if (hit_ok or time_ok):
+                            if sid not in sustain_tabs and len(sustain_tabs) < MAX_SUSTAIN_TABS:
+                                sustain_tabs[sid] = p
+                                print(
+                                    f"[SUSTAIN] SID={sid} "
+                                    f"hits={high_cpu_hits.get(sid, 0)}"
+                                )
+                                continue
 
                         p.close()
 
@@ -237,13 +258,14 @@ def main():
                     log_cpu(sid, cpu)
                     maybe_print(sid, cpu)
 
-                    if cpu < 30:
+                    if cpu < SUSTAIN_CPU_THRESHOLD:
                         sustain_since.setdefault(sid, now)
                         if now - sustain_since[sid] >= SUSTAIN_EXIT_SEC:
                             print(f"[SUSTAIN] SID={sid} 移出持续监控")
                             p.close()
                             sustain_tabs.pop(sid, None)
                             sustain_since.pop(sid, None)
+                            high_cpu_hits.pop(sid, None)
                     else:
                         sustain_since.pop(sid, None)
 
@@ -254,12 +276,8 @@ def main():
 
         except KeyboardInterrupt:
             print("\n[+] 正常退出")
-            running = False
         finally:
-            try:
-                browser.close()
-            except:
-                pass
+            browser.close()
 
 if __name__ == "__main__":
     main()
