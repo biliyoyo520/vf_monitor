@@ -11,7 +11,7 @@ DEBUG = "--debug" in sys.argv
 
 CPU_PRINT_THRESHOLD = 30.0
 SUSTAIN_CPU_THRESHOLD = 30.0
-SUSTAIN_HIT_COUNT = 10      # 连续 a 次
+SUSTAIN_HIT_COUNT = 3      # 连续 3 次超占用
 TAB_BATCH_SIZE = 5
 MAX_SUSTAIN_TABS = 20
 
@@ -24,9 +24,33 @@ SUSTAIN_EXIT_SEC = 30 * 60
 
 WATCHDOG_TIMEOUT = 120  # 秒
 
+# ================= 密码 =================
+def input_password_masked(prompt="Password: "):
+    import msvcrt
+    print(prompt, end="", flush=True)
+    pwd = ""
+    while True:
+        ch = msvcrt.getch()
+        if ch in (b"\r", b"\n"):
+            print()
+            break
+        elif ch == b"\x08":  # Backspace
+            if pwd:
+                pwd = pwd[:-1]
+                print("\b \b", end="", flush=True)
+        elif ch == b"\x03":  # Ctrl+C
+            raise KeyboardInterrupt
+        else:
+            try:
+                c = ch.decode("utf-8")
+            except:
+                continue
+            pwd += c
+            print("*", end="", flush=True)
+    return pwd
 # ================= 登录信息 =================
 VF_EMAIL = input("VirtFusion Email: ")
-VF_PASSWORD = getpass.getpass("VirtFusion Password: ")
+VF_PASSWORD = input_password_masked("VirtFusion Password: ")
 
 # ================= 配置 =================
 BASE_URL = "https://vf.ciallo.ee"
