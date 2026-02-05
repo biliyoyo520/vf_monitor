@@ -28,6 +28,10 @@ POLL_INTERVAL = 3
 SERVER_REFRESH_INTERVAL = 3600
 WATCHDOG_TIMEOUT = 120
 
+# ================= Watchdog 异常 =================
+class WatchdogRestart(Exception):
+    pass
+
 # ================= 密码 =================
 def input_password_masked(prompt="Password: "):
     import msvcrt
@@ -164,80 +168,94 @@ def fetch_cpu(page, sid):
     except:
         return None
 
-# ================= 主循环 =================
+# ================= 单次运行 =================
+def run_once(pw):
+    global last_success_ts
+
+    browser = pw.chromium.launch(
+        headless=not HEADFUL,
+        args=["--disable-gpu", "--no-sandbox"]
+    )
+    ctx = browser.new_context()
+    page = ctx.new_page()
+
+    auto_login(page)
+    ids = get_all_server_ids(page)
+    last_refresh = time.time()
+
+    print("[*] 开始监控")
+
+    while True:
+        now = time.time()
+
+        if now - last_success_ts > WATCHDOG_TIMEOUT:
+            browser.close()
+            raise WatchdogRestart()
+
+        if now - last_refresh > SERVER_REFRESH_INTERVAL:
+            ids = get_all_server_ids(page)
+            last_refresh = now
+
+        if not ids:
+            print("[WARN] 当前服务器列表为空，跳过一轮")
+            time.sleep(5)
+            continue
+
+        for i in range(0, len(ids), TAB_BATCH_SIZE):
+            pages = {}
+            for sid in ids[i:i + TAB_BATCH_SIZE]:
+                p = ctx.new_page()
+                try:
+                    p.goto(f"{BASE_URL}/admin/servers/{sid}", timeout=15_000)
+                    pages[sid] = p
+                except:
+                    p.close()
+
+            for sid, p in pages.items():
+                cpu = fetch_cpu(p, sid)
+                p.close()
+                if cpu is None:
+                    continue
+
+                log_cpu(sid, cpu)
+
+                # ===== DEBUG 输出 =====
+                if DEBUG_LEVEL >= 1:
+                    msg = f"[CPU] SID={sid} now={cpu:.1f}%"
+                    if DEBUG_LEVEL >= 2:
+                        avg = read_last_24h_avg(sid)
+                        msg += f" | 24h_avg={avg:.1f}%" if avg is not None else " | 24h_avg=N/A"
+                    print(msg)
+
+                # ===== 规则 =====
+                if cpu >= CPU_HIGH:
+                    cpu_90_accumulate[sid] = cpu_90_accumulate.get(sid, 0) + POLL_INTERVAL
+                    if cpu_90_accumulate[sid] >= 3600:
+                        alert(sid, "R1(累计90%≥1h)")
+
+                    cpu_90_continuous.setdefault(sid, now)
+                    if now - cpu_90_continuous[sid] >= 3600:
+                        alert(sid, "R2(连续90%≥1h)")
+                else:
+                    cpu_90_continuous.pop(sid, None)
+
+                avg = read_last_24h_avg(sid)
+                if avg is not None and avg >= CPU_AVG_THRESHOLD:
+                    alert(sid, "R3(24h平均≥30%)")
+
+        time.sleep(POLL_INTERVAL)
+
+# ================= 主入口 =================
 def main():
     ensure_dir(LOG_ROOT)
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=not HEADFUL,
-            args=["--disable-gpu", "--no-sandbox"]
-        )
-        ctx = browser.new_context()
-        page = ctx.new_page()
-
-        auto_login(page)
-        ids = get_all_server_ids(page)
-        last_refresh = time.time()
-
-        print("[*] 开始监控")
-
         while True:
-            now = time.time()
-
-            if now - last_success_ts > WATCHDOG_TIMEOUT:
+            try:
+                run_once(pw)
+            except WatchdogRestart:
                 print("[WATCHDOG] 重启浏览器")
-                browser.close()
-                return main()
-
-            if now - last_refresh > SERVER_REFRESH_INTERVAL:
-                ids = get_all_server_ids(page)
-                last_refresh = now
-
-            for i in range(0, len(ids), TAB_BATCH_SIZE):
-                pages = {}
-                for sid in ids[i:i + TAB_BATCH_SIZE]:
-                    p = ctx.new_page()
-                    try:
-                        p.goto(f"{BASE_URL}/admin/servers/{sid}", timeout=15_000)
-                        pages[sid] = p
-                    except:
-                        p.close()
-
-                for sid, p in pages.items():
-                    cpu = fetch_cpu(p, sid)
-                    p.close()
-                    if cpu is None:
-                        continue
-
-                    log_cpu(sid, cpu)
-
-                    # ===== ★ DEBUG 输出 ★ =====
-                    if DEBUG_LEVEL >= 1:
-                        msg = f"[CPU] SID={sid} now={cpu:.1f}%"
-                        if DEBUG_LEVEL >= 2:
-                            avg = read_last_24h_avg(sid)
-                            msg += f" | 24h_avg={avg:.1f}%" if avg is not None else " | 24h_avg=N/A"
-                        print(msg)
-
-                    # ===== 规则 1 / 2 =====
-                    if cpu >= CPU_HIGH:
-                        cpu_90_accumulate[sid] = cpu_90_accumulate.get(sid, 0) + POLL_INTERVAL
-                        if cpu_90_accumulate[sid] >= 3600:
-                            alert(sid, "R1(累计90%≥1h)")
-
-                        cpu_90_continuous.setdefault(sid, now)
-                        if now - cpu_90_continuous[sid] >= 3600:
-                            alert(sid, "R2(连续90%≥1h)")
-                    else:
-                        cpu_90_continuous.pop(sid, None)
-
-                    # ===== 规则 3 =====
-                    avg = read_last_24h_avg(sid)
-                    if avg is not None and avg >= CPU_AVG_THRESHOLD:
-                        alert(sid, "R3(24h平均≥30%)")
-
-            time.sleep(POLL_INTERVAL)
+                continue
 
 if __name__ == "__main__":
     main()
