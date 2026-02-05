@@ -6,7 +6,14 @@ from datetime import datetime, timedelta
 from playwright.sync_api import sync_playwright
 
 # ================= 参数 =================
-DEBUG = "--debug" in sys.argv
+DEBUG_LEVEL = 0
+if "--debug" in sys.argv:
+    idx = sys.argv.index("--debug")
+    try:
+        DEBUG_LEVEL = int(sys.argv[idx + 1])
+    except:
+        DEBUG_LEVEL = 1
+
 
 CPU_AVG_THRESHOLD = 30.0
 CPU_HIGH = 90.0
@@ -110,23 +117,43 @@ def auto_login(page):
 def get_all_server_ids(page):
     page.goto(SERVERS_URL)
     time.sleep(2)
+
     ids = set()
+    page_no = 1
 
     while True:
+        print(f"[*] 扫描服务器列表 第 {page_no} 页")
+
+        # ===== 收集当前页 =====
         for r in page.query_selector_all("tr"):
             if not r.query_selector("span.badge-success"):
                 continue
-            cb = r.query_selector("input[type='checkbox']")
+            cb = r.query_selector("input.form-check-input[type='checkbox']")
             if cb:
                 ids.add(cb.get_attribute("value"))
 
-        nxt = page.query_selector("li.page-item.c-pointer span.page-link")
-        if not nxt:
+        # ===== 找右翻页按钮 =====
+        next_btn = page.query_selector(
+            "ul.pagination li.page-item.c-pointer span.page-link:text-is('»')"
+        )
+
+        # 没有下一页 or 被禁用 → 结束
+        if not next_btn:
             break
-        nxt.click()
+
+        parent = next_btn.evaluate_handle("el => el.parentElement")
+        disabled = parent.get_attribute("class") or ""
+        if "disabled" in disabled:
+            break
+
+        # 翻页
+        next_btn.click()
+        page_no += 1
         time.sleep(2)
 
+    print(f"[+] 发现 Active 服务器: {len(ids)}")
     return list(ids)
+
 
 # ================= 抓 CPU =================
 def fetch_cpu(page, sid):
@@ -144,7 +171,7 @@ def main():
     ensure_dir(LOG_ROOT)
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(headless=False if DEBUG_LEVEL >= 3 else True)
         ctx = browser.new_context()
         page = ctx.new_page()
 
