@@ -275,26 +275,42 @@ def main():
 
                 # ===== 持续监控 =====
                 for sid, p in list(sustain_tabs.items()):
+                    # 保险：页面已被关掉就直接跳过
+                    if p.is_closed():
+                        sustain_tabs.pop(sid, None)
+                        sustain_since.pop(sid, None)
+                        high_cpu_hits.pop(sid, None)
+                        continue
+                    
                     cpu = fetch_cpu(p, sid)
                     if cpu is None:
                         continue
-
+                    
                     log_cpu(sid, cpu)
                     maybe_print(sid, cpu)
-
+                
                     if cpu < SUSTAIN_CPU_THRESHOLD:
                         sustain_since.setdefault(sid, now)
                         if now - sustain_since[sid] >= SUSTAIN_EXIT_SEC:
                             print(f"[SUSTAIN] SID={sid} 移出持续监控")
-                            p.close()
+                            try:
+                                p.close()
+                            except:
+                                pass
                             sustain_tabs.pop(sid, None)
                             sustain_since.pop(sid, None)
                             high_cpu_hits.pop(sid, None)
+                            continue   # ⭐⭐ 关键：绝不能再 reload
                     else:
                         sustain_since.pop(sid, None)
-
-                    p.reload()
+                
+                    try:
+                        p.reload()
+                    except:
+                        pass
+                    
                     time.sleep(SUSTAIN_INTERVAL)
+
 
                 time.sleep(POLL_INTERVAL)
 
