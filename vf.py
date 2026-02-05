@@ -1,30 +1,18 @@
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from playwright.sync_api import sync_playwright
 
-# ================= Debug 参数 =================
-DEBUG_LEVEL = 0
-if "--debug" in sys.argv:
-    idx = sys.argv.index("--debug")
-    try:
-        DEBUG_LEVEL = int(sys.argv[idx + 1])
-    except:
-        DEBUG_LEVEL = 1
-
 # ================= 参数 =================
-CPU_PRINT_THRESHOLD = 30.0
+DEBUG = "--debug" in sys.argv
 
-CPU_ALARM_THRESHOLD = 90.0
-CPU_DAILY_LIMIT_SEC = 3600      # 当天累计 1h
-CPU_CONT_LIMIT_SEC = 3600       # 连续 1h
-CPU_24H_AVG_THRESHOLD = 30.0
+CPU_AVG_THRESHOLD = 30.0
+CPU_HIGH = 90.0
 
 TAB_BATCH_SIZE = 5
 POLL_INTERVAL = 3
-
 SERVER_REFRESH_INTERVAL = 3600
 WATCHDOG_TIMEOUT = 120
 
@@ -52,22 +40,19 @@ def input_password_masked(prompt="Password: "):
                 pass
     return pwd
 
+# ================= 登录信息 =================
 VF_EMAIL = input("VirtFusion Email: ")
 VF_PASSWORD = input_password_masked("VirtFusion Password: ")
 
-# ================= 配置 =================
 BASE_URL = "https://vf.ciallo.ee"
 SERVERS_URL = f"{BASE_URL}/admin/servers"
 LOG_ROOT = "logs"
 
 # ================= 状态 =================
-warn_count = {}
+cpu_90_accumulate = {}    # sid -> seconds
+cpu_90_continuous = {}    # sid -> start_ts
+alerted = set()
 
-daily_90_usage_sec = {}     # sid -> 今日累计 >=90% 秒
-cpu_90_cont_since = {}      # sid -> 连续 >=90% 起始时间
-cpu_samples = {}            # sid -> [(ts, cpu)]
-
-last_day = datetime.now().date()
 last_success_ts = time.time()
 
 # ================= 工具 =================
@@ -78,116 +63,84 @@ def log_cpu(sid, cpu):
     date = datetime.now().strftime("%Y-%m-%d")
     path = os.path.join(LOG_ROOT, sid)
     ensure_dir(path)
-    with open(os.path.join(path, f"{date}.log"), "a", encoding="utf-8") as f:
+    with open(os.path.join(path, f"{date}.log"), "a") as f:
         f.write(f"{datetime.now().isoformat()} {cpu}\n")
 
-def color_cpu(cpu):
-    if cpu >= 95:
-        return f"\033[5;31m{cpu:6.2f}%\033[0m"
-    elif cpu >= 50:
-        return f"\033[31m{cpu:6.2f}%\033[0m"
-    elif cpu >= 30:
-        return f"\033[33m{cpu:6.2f}%\033[0m"
-    else:
-        return f"{cpu:6.2f}%"
-
-def get_24h_avg(sid):
-    samples = cpu_samples.get(sid, [])
-    if not samples:
+def read_last_24h_avg(sid):
+    path = os.path.join(LOG_ROOT, sid)
+    if not os.path.exists(path):
         return None
-    return sum(c for _, c in samples) / len(samples)
 
-# ================= 报警判定 =================
-def should_alarm(sid, cpu, now):
-    global last_day
+    cutoff = datetime.now() - timedelta(hours=24)
+    total = count = 0
 
-    # ===== 跨天清零 =====
-    today = datetime.now().date()
-    if today != last_day:
-        daily_90_usage_sec.clear()
-        cpu_90_cont_since.clear()
-        last_day = today
+    for fn in os.listdir(path):
+        if not fn.endswith(".log"):
+            continue
+        with open(os.path.join(path, fn)) as f:
+            for line in f:
+                try:
+                    ts, cpu = line.split()
+                    ts = datetime.fromisoformat(ts)
+                    if ts >= cutoff:
+                        total += float(cpu)
+                        count += 1
+                except:
+                    pass
 
-    # ===== 记录样本 =====
-    samples = cpu_samples.setdefault(sid, [])
-    samples.append((now, cpu))
+    if count == 0:
+        return None
+    return total / count
 
-    cutoff = now - 24 * 3600
-    cpu_samples[sid] = [(t, c) for t, c in samples if t >= cutoff]
-
-    # ===== 规则 1：当天累计 >=90% =====
-    if cpu >= CPU_ALARM_THRESHOLD:
-        daily_90_usage_sec[sid] = daily_90_usage_sec.get(sid, 0) + POLL_INTERVAL
-        if daily_90_usage_sec[sid] >= CPU_DAILY_LIMIT_SEC:
-            return True, "当天累计跑满 CPU ≥ 1h"
-
-    # ===== 规则 2：连续 >=90% =====
-    if cpu >= CPU_ALARM_THRESHOLD:
-        cpu_90_cont_since.setdefault(sid, now)
-        if now - cpu_90_cont_since[sid] >= CPU_CONT_LIMIT_SEC:
-            return True, "连续跑满 CPU ≥ 1h"
-    else:
-        cpu_90_cont_since.pop(sid, None)
-
-    # ===== 规则 3：前 24h 平均 =====
-    avg = get_24h_avg(sid)
-    if avg is not None and avg >= CPU_24H_AVG_THRESHOLD:
-        return True, f"前24h平均 CPU {avg:.1f}%"
-
-    return False, None
-
-def maybe_print(sid, cpu, alarm, reason):
-    ts = datetime.now().strftime("%H:%M:%S")
-    avg = get_24h_avg(sid)
-
-    if alarm:
-        cnt = warn_count.get(sid, 0) + 1
-        warn_count[sid] = cnt
-        print(
-            f"[{ts}] SID={sid} CPU={color_cpu(cpu)} "
-            f"!!! 第{cnt}次警告 | {reason}"
-        )
+def alert(sid, reason):
+    if sid in alerted:
         return
+    alerted.add(sid)
+    print(f"[ALERT] SID={sid} 命中规则: {reason}")
 
-    if DEBUG_LEVEL >= 1:
-        if DEBUG_LEVEL >= 2 and avg is not None:
-            print(
-                f"[{ts}] SID={sid} CPU={color_cpu(cpu)} "
-                f"| 24h_avg={avg:5.1f}%"
-            )
-        else:
-            print(f"[{ts}] SID={sid} CPU={color_cpu(cpu)}")
-
-# ================= 登录 / 抓取 =================
+# ================= 登录 =================
 def auto_login(page):
     page.goto(BASE_URL)
-    page.wait_for_selector("input[type='email']")
     page.fill("input[type='email']", VF_EMAIL)
     page.fill("input[type='password']", VF_PASSWORD)
     page.click("button.btn-primary")
-    page.wait_for_url("**/admin/dashboard")
+    page.wait_for_url("**/admin/dashboard", timeout=30_000)
 
+# ================= 抓服务器 =================
 def get_all_server_ids(page):
     page.goto(SERVERS_URL)
     time.sleep(2)
     ids = set()
-    for r in page.query_selector_all("tr"):
-        if r.query_selector("span.badge-success"):
-            cb = r.query_selector("input.form-check-input")
+
+    while True:
+        for r in page.query_selector_all("tr"):
+            if not r.query_selector("span.badge-success"):
+                continue
+            cb = r.query_selector("input[type='checkbox']")
             if cb:
                 ids.add(cb.get_attribute("value"))
-    print(f"[+] 发现 Active 服务器 {len(ids)} 台")
+
+        nxt = page.query_selector("li.page-item.c-pointer span.page-link")
+        if not nxt:
+            break
+        nxt.click()
+        time.sleep(2)
+
     return list(ids)
 
-def fetch_cpu(page):
+# ================= 抓 CPU =================
+def fetch_cpu(page, sid):
     global last_success_ts
-    page.wait_for_selector("#cpuGauge text.value-text", timeout=15_000)
-    txt = page.text_content("#cpuGauge text.value-text")
-    last_success_ts = time.time()
-    return float(txt.replace("%", "").strip())
+    try:
+        txt = page.text_content("#cpuGauge text.value-text")
+        cpu = float(txt.replace("%", ""))
+        last_success_ts = time.time()
+        return cpu
+    except:
+        return None
 
-# ================= 单次运行 =================
-def run_once():
+# ================= 主循环 =================
+def main():
     ensure_dir(LOG_ROOT)
 
     with sync_playwright() as pw:
@@ -199,14 +152,14 @@ def run_once():
         ids = get_all_server_ids(page)
         last_refresh = time.time()
 
-        print("[*] 开始监控（Ctrl+C 退出）")
+        print("[*] 开始监控")
 
         while True:
             now = time.time()
 
             if now - last_success_ts > WATCHDOG_TIMEOUT:
-                print("[WATCHDOG] 超时，重启 Playwright")
-                break
+                browser.close()
+                return main()
 
             if now - last_refresh > SERVER_REFRESH_INTERVAL:
                 ids = get_all_server_ids(page)
@@ -223,28 +176,32 @@ def run_once():
                         p.close()
 
                 for sid, p in pages.items():
-                    try:
-                        cpu = fetch_cpu(p)
-                        log_cpu(sid, cpu)
-                        alarm, reason = should_alarm(sid, cpu, now)
-                        maybe_print(sid, cpu, alarm, reason)
-                    finally:
-                        p.close()
+                    cpu = fetch_cpu(p, sid)
+                    p.close()
+                    if cpu is None:
+                        continue
+
+                    log_cpu(sid, cpu)
+
+                    # ===== 规则 1：累计 ≥90% =====
+                    if cpu >= CPU_HIGH:
+                        cpu_90_accumulate[sid] = cpu_90_accumulate.get(sid, 0) + POLL_INTERVAL
+                        if cpu_90_accumulate[sid] >= 3600:
+                            alert(sid, "R1(累计90%≥1h)")
+                    # ===== 规则 2：连续 ≥90% =====
+                    if cpu >= CPU_HIGH:
+                        cpu_90_continuous.setdefault(sid, now)
+                        if now - cpu_90_continuous[sid] >= 3600:
+                            alert(sid, "R2(连续90%≥1h)")
+                    else:
+                        cpu_90_continuous.pop(sid, None)
+
+                    # ===== 规则 3：24h 平均 =====
+                    avg = read_last_24h_avg(sid)
+                    if avg is not None and avg >= CPU_AVG_THRESHOLD:
+                        alert(sid, "R3(24h平均≥30%)")
 
             time.sleep(POLL_INTERVAL)
-
-# ================= 主入口 =================
-def main():
-    while True:
-        try:
-            run_once()
-            time.sleep(5)
-        except KeyboardInterrupt:
-            print("\n[+] 正常退出")
-            break
-        except Exception as e:
-            print(f"[FATAL] {e}")
-            time.sleep(5)
 
 if __name__ == "__main__":
     main()
