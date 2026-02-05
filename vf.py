@@ -2,6 +2,7 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta
+from collections import deque, defaultdict
 
 from playwright.sync_api import sync_playwright
 
@@ -28,9 +29,21 @@ POLL_INTERVAL = 3
 SERVER_REFRESH_INTERVAL = 3600
 WATCHDOG_TIMEOUT = 120
 
+CPU_5MIN_WINDOW = 300  # 秒
+
 # ================= Watchdog 异常 =================
 class WatchdogRestart(Exception):
     pass
+
+# ================= 状态 =================
+cpu_90_accumulate = {}
+cpu_90_continuous = {}
+alerted = set()
+
+cpu_5min_samples = defaultdict(deque)
+last_5min_report = 0
+
+last_success_ts = time.time()
 
 # ================= 密码 =================
 def input_password_masked(prompt="Password: "):
@@ -63,13 +76,6 @@ VF_PASSWORD = input_password_masked("VirtFusion Password: ")
 BASE_URL = "https://vf.ciallo.ee"
 SERVERS_URL = f"{BASE_URL}/admin/servers"
 LOG_ROOT = "logs"
-
-# ================= 状态 =================
-cpu_90_accumulate = {}
-cpu_90_continuous = {}
-alerted = set()
-
-last_success_ts = time.time()
 
 # ================= 工具 =================
 def ensure_dir(p):
@@ -109,8 +115,19 @@ def read_last_24h_avg(sid):
 def alert(sid, reason):
     if sid in alerted:
         return
+    clear_progress()
     alerted.add(sid)
     print(f"[ALERT] SID={sid} 命中规则: {reason}")
+
+# ================= 进度条 =================
+def render_progress(done, total):
+    bar_len = 30
+    filled = int(bar_len * done / total) if total else 0
+    bar = "█" * filled + "-" * (bar_len - filled)
+    print(f"\r[SCAN] |{bar}| {done}/{total}", end="", flush=True)
+
+def clear_progress():
+    print("\r" + " " * 100 + "\r", end="", flush=True)
 
 # ================= 登录 =================
 def auto_login(page):
@@ -130,6 +147,7 @@ def get_all_server_ids(page):
 
     while True:
         if DEBUG:
+            clear_progress()
             print(f"[*] 扫描服务器列表 第 {page_no} 页")
 
         for r in page.query_selector_all("tr"):
@@ -154,6 +172,7 @@ def get_all_server_ids(page):
         page_no += 1
         time.sleep(2)
 
+    clear_progress()
     print(f"[+] 发现 Active 服务器: {len(ids)}")
     return list(ids)
 
@@ -170,7 +189,7 @@ def fetch_cpu(page, sid):
 
 # ================= 单次运行 =================
 def run_once(pw):
-    global last_success_ts
+    global last_5min_report
 
     browser = pw.chromium.launch(
         headless=not HEADFUL,
@@ -196,10 +215,8 @@ def run_once(pw):
             ids = get_all_server_ids(page)
             last_refresh = now
 
-        if not ids:
-            print("[WARN] 当前服务器列表为空，跳过一轮")
-            time.sleep(5)
-            continue
+        scanned = 0
+        total = len(ids)
 
         for i in range(0, len(ids), TAB_BATCH_SIZE):
             pages = {}
@@ -214,25 +231,32 @@ def run_once(pw):
             for sid, p in pages.items():
                 cpu = fetch_cpu(p, sid)
                 p.close()
+                scanned += 1
+                render_progress(scanned, total)
+
                 if cpu is None:
                     continue
 
                 log_cpu(sid, cpu)
 
-                # ===== DEBUG 输出 =====
+                now_ts = time.time()
+                dq = cpu_5min_samples[sid]
+                dq.append((now_ts, cpu))
+                while dq and now_ts - dq[0][0] > CPU_5MIN_WINDOW:
+                    dq.popleft()
+
                 if DEBUG_LEVEL >= 1:
+                    clear_progress()
                     msg = f"[CPU] SID={sid} now={cpu:.1f}%"
                     if DEBUG_LEVEL >= 2:
                         avg = read_last_24h_avg(sid)
-                        msg += f" | 24h_avg={avg:.1f}%" if avg is not None else " | 24h_avg=N/A"
+                        msg += f" | 24h_avg={avg:.1f}%" if avg else " | 24h_avg=N/A"
                     print(msg)
 
-                # ===== 规则 =====
                 if cpu >= CPU_HIGH:
                     cpu_90_accumulate[sid] = cpu_90_accumulate.get(sid, 0) + POLL_INTERVAL
                     if cpu_90_accumulate[sid] >= 3600:
                         alert(sid, "R1(累计90%≥1h)")
-
                     cpu_90_continuous.setdefault(sid, now)
                     if now - cpu_90_continuous[sid] >= 3600:
                         alert(sid, "R2(连续90%≥1h)")
@@ -243,19 +267,43 @@ def run_once(pw):
                 if avg is not None and avg >= CPU_AVG_THRESHOLD:
                     alert(sid, "R3(24h平均≥30%)")
 
+        # ===== 每 5 分钟 Top5 =====
+        if time.time() - last_5min_report >= 300:
+            last_5min_report = time.time()
+            clear_progress()
+
+            print("\n[STATS][5min] Top5 CPU:")
+            stats_5m = []
+            for sid, dq in cpu_5min_samples.items():
+                if dq:
+                    avg = sum(v for _, v in dq) / len(dq)
+                    stats_5m.append((avg, sid))
+            for avg, sid in sorted(stats_5m, reverse=True)[:5]:
+                print(f"  SID={sid} avg={avg:.1f}%")
+
+            print("[STATS][24h] Top5 CPU:")
+            stats_24h = []
+            for sid in cpu_5min_samples.keys():
+                avg = read_last_24h_avg(sid)
+                if avg is not None:
+                    stats_24h.append((avg, sid))
+            for avg, sid in sorted(stats_24h, reverse=True)[:5]:
+                print(f"  SID={sid} avg={avg:.1f}%")
+
+            print("-" * 40)
+
         time.sleep(POLL_INTERVAL)
 
 # ================= 主入口 =================
 def main():
     ensure_dir(LOG_ROOT)
-
     with sync_playwright() as pw:
         while True:
             try:
                 run_once(pw)
             except WatchdogRestart:
+                clear_progress()
                 print("[WATCHDOG] 重启浏览器")
-                continue
 
 if __name__ == "__main__":
     main()
