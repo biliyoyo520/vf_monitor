@@ -61,8 +61,8 @@ SERVERS_URL = f"{BASE_URL}/admin/servers"
 LOG_ROOT = "logs"
 
 # ================= 状态 =================
-cpu_90_accumulate = {}    # sid -> seconds
-cpu_90_continuous = {}    # sid -> start_ts
+cpu_90_accumulate = {}
+cpu_90_continuous = {}
 alerted = set()
 
 last_success_ts = time.time()
@@ -212,6 +212,15 @@ def main():
 
                     log_cpu(sid, cpu)
 
+                    # ===== ★ DEBUG 输出 ★ =====
+                    if DEBUG_LEVEL >= 1:
+                        msg = f"[CPU] SID={sid} now={cpu:.1f}%"
+                        if DEBUG_LEVEL >= 2:
+                            avg = read_last_24h_avg(sid)
+                            msg += f" | 24h_avg={avg:.1f}%" if avg is not None else " | 24h_avg=N/A"
+                        print(msg)
+
+                    # ===== 规则 1 / 2 =====
                     if cpu >= CPU_HIGH:
                         cpu_90_accumulate[sid] = cpu_90_accumulate.get(sid, 0) + POLL_INTERVAL
                         if cpu_90_accumulate[sid] >= 3600:
@@ -223,6 +232,7 @@ def main():
                     else:
                         cpu_90_continuous.pop(sid, None)
 
+                    # ===== 规则 3 =====
                     avg = read_last_24h_avg(sid)
                     if avg is not None and avg >= CPU_AVG_THRESHOLD:
                         alert(sid, "R3(24h平均≥30%)")
