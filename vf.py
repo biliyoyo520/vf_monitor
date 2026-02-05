@@ -11,18 +11,18 @@ DEBUG = "--debug" in sys.argv
 
 CPU_PRINT_THRESHOLD = 30.0
 SUSTAIN_CPU_THRESHOLD = 30.0
-SUSTAIN_HIT_COUNT = 3      # 连续 3 次超占用
+SUSTAIN_HIT_COUNT = 3
 TAB_BATCH_SIZE = 5
 MAX_SUSTAIN_TABS = 20
 
 POLL_INTERVAL = 3
 SUSTAIN_INTERVAL = 3
 
-SERVER_REFRESH_INTERVAL = 3600  # 1 小时
+SERVER_REFRESH_INTERVAL = 3600
 SUSTAIN_ENTER_SEC = 30 * 60
 SUSTAIN_EXIT_SEC = 30 * 60
 
-WATCHDOG_TIMEOUT = 120  # 秒
+WATCHDOG_TIMEOUT = 120
 
 # ================= 密码 =================
 def input_password_masked(prompt="Password: "):
@@ -34,20 +34,20 @@ def input_password_masked(prompt="Password: "):
         if ch in (b"\r", b"\n"):
             print()
             break
-        elif ch == b"\x08":  # Backspace
+        elif ch == b"\x08":
             if pwd:
                 pwd = pwd[:-1]
                 print("\b \b", end="", flush=True)
-        elif ch == b"\x03":  # Ctrl+C
+        elif ch == b"\x03":
             raise KeyboardInterrupt
         else:
             try:
-                c = ch.decode("utf-8")
+                pwd += ch.decode("utf-8")
+                print("*", end="", flush=True)
             except:
-                continue
-            pwd += c
-            print("*", end="", flush=True)
+                pass
     return pwd
+
 # ================= 登录信息 =================
 VF_EMAIL = input("VirtFusion Email: ")
 VF_PASSWORD = input_password_masked("VirtFusion Password: ")
@@ -58,15 +58,14 @@ SERVERS_URL = f"{BASE_URL}/admin/servers"
 LOG_ROOT = "logs"
 
 # ================= 状态 =================
-warn_count = {}
-cpu_ema = {}
+warn_count = {}              # 第 n 次警告（会被清零）
+daily_sustain_count = {}    # 今日连续超限次数
 
-high_cpu_hits = {}     # sid -> 连续命中次数
-sustain_since = {}    # sid -> 时间戳
-sustain_tabs = {}     # sid -> page
+high_cpu_hits = {}
+sustain_since = {}
+sustain_tabs = {}
 
 last_success_ts = time.time()
-running = True
 
 # ================= 工具 =================
 def ensure_dir(p):
@@ -91,10 +90,15 @@ def color_cpu(cpu):
 
 def maybe_print(sid, cpu):
     ts = datetime.now().strftime("%H:%M:%S")
+    daily = daily_sustain_count.get(sid, 0)
+
     if cpu >= CPU_PRINT_THRESHOLD:
         cnt = warn_count.get(sid, 0) + 1
         warn_count[sid] = cnt
-        print(f"[{ts}] SID={sid} CPU={color_cpu(cpu)} !!! 第{cnt}次警告")
+        print(
+            f"[{ts}] SID={sid} CPU={color_cpu(cpu)} "
+            f"!!! 第{cnt}次警告 | 今日连续超限 {daily} 次"
+        )
     elif DEBUG:
         print(f"[{ts}] SID={sid} CPU={color_cpu(cpu)}")
 
@@ -111,8 +115,7 @@ def auto_login(page):
         """() => {
             const btn = document.querySelector("button.btn-primary");
             return btn && !btn.disabled;
-        }""",
-        timeout=10_000
+        }"""
     )
 
     page.click("button.btn-primary")
@@ -128,9 +131,7 @@ def get_all_server_ids(page):
     visited = set()
 
     while True:
-        cur = page.query_selector(
-            "ul.pagination li.page-item.active span.page-link"
-        )
+        cur = page.query_selector("ul.pagination li.page-item.active span.page-link")
         if not cur:
             break
 
@@ -147,9 +148,7 @@ def get_all_server_ids(page):
                 ids.add(cb.get_attribute("value"))
 
         nxt = None
-        for el in page.query_selector_all(
-            "ul.pagination li.page-item.c-pointer span.page-link"
-        ):
+        for el in page.query_selector_all("ul.pagination li.page-item.c-pointer span.page-link"):
             t = el.inner_text().strip()
             if t.isdigit() and t not in visited:
                 nxt = el
@@ -179,8 +178,6 @@ def fetch_cpu(page, sid):
 
 # ================= 主循环 =================
 def main():
-    global last_success_ts
-
     ensure_dir(LOG_ROOT)
 
     with sync_playwright() as pw:
@@ -228,11 +225,7 @@ def main():
                             continue
                         p = ctx.new_page()
                         try:
-                            p.goto(
-                                f"{BASE_URL}/admin/servers/{sid}",
-                                wait_until="domcontentloaded",
-                                timeout=15_000
-                            )
+                            p.goto(f"{BASE_URL}/admin/servers/{sid}", timeout=15_000)
                             pages[sid] = p
                         except:
                             p.close()
@@ -246,7 +239,6 @@ def main():
                         log_cpu(sid, cpu)
                         maybe_print(sid, cpu)
 
-                        # ===== sustain 判定 =====
                         if cpu >= SUSTAIN_CPU_THRESHOLD:
                             high_cpu_hits[sid] = high_cpu_hits.get(sid, 0) + 1
                         else:
@@ -257,42 +249,40 @@ def main():
                         if hit_ok:
                             sustain_since.setdefault(sid, now)
 
-                        time_ok = (
-                            sid in sustain_since and
-                            now - sustain_since[sid] >= SUSTAIN_ENTER_SEC
-                        )
+                        time_ok = sid in sustain_since and now - sustain_since[sid] >= SUSTAIN_ENTER_SEC
 
                         if (hit_ok or time_ok):
                             if sid not in sustain_tabs and len(sustain_tabs) < MAX_SUSTAIN_TABS:
                                 sustain_tabs[sid] = p
-                                print(
-                                    f"[SUSTAIN] SID={sid} "
-                                    f"hits={high_cpu_hits.get(sid, 0)}"
-                                )
+                                print(f"[SUSTAIN] SID={sid} 进入持续监控")
                                 continue
 
                         p.close()
 
                 # ===== 持续监控 =====
                 for sid, p in list(sustain_tabs.items()):
-                    # 保险：页面已被关掉就直接跳过
                     if p.is_closed():
                         sustain_tabs.pop(sid, None)
                         sustain_since.pop(sid, None)
                         high_cpu_hits.pop(sid, None)
                         continue
-                    
+
                     cpu = fetch_cpu(p, sid)
                     if cpu is None:
                         continue
-                    
+
                     log_cpu(sid, cpu)
                     maybe_print(sid, cpu)
-                
+
                     if cpu < SUSTAIN_CPU_THRESHOLD:
                         sustain_since.setdefault(sid, now)
                         if now - sustain_since[sid] >= SUSTAIN_EXIT_SEC:
-                            print(f"[SUSTAIN] SID={sid} 移出持续监控")
+                            daily_sustain_count[sid] = daily_sustain_count.get(sid, 0) + 1
+                            warn_count.pop(sid, None)   # ⭐ 清零第 n 次警告
+                            print(
+                                f"[SUSTAIN] SID={sid} 移出持续监控 "
+                                f"(今日连续超限 {daily_sustain_count[sid]} 次)"
+                            )
                             try:
                                 p.close()
                             except:
@@ -300,17 +290,16 @@ def main():
                             sustain_tabs.pop(sid, None)
                             sustain_since.pop(sid, None)
                             high_cpu_hits.pop(sid, None)
-                            continue   # ⭐⭐ 关键：绝不能再 reload
+                            continue
                     else:
                         sustain_since.pop(sid, None)
-                
+
                     try:
                         p.reload()
                     except:
                         pass
-                    
-                    time.sleep(SUSTAIN_INTERVAL)
 
+                    time.sleep(SUSTAIN_INTERVAL)
 
                 time.sleep(POLL_INTERVAL)
 
