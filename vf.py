@@ -279,7 +279,7 @@ def run_once(pw):
         # ===== 每 5 分钟 Top5 =====
         if time.time() - last_5min_report >= 300:
             last_5min_report = time.time()
-            lines = ["[STATS][5min] Top5 CPU:"]
+            lines = ["[STATS][Last Scan] Top5 CPU:"]
             stats = []
             for sid, dq in cpu_5min_samples.items():
                 if dq:
