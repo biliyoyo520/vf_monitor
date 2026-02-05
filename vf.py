@@ -9,11 +9,16 @@ from playwright.sync_api import sync_playwright
 DEBUG_LEVEL = 0
 if "--debug" in sys.argv:
     idx = sys.argv.index("--debug")
-    try:
-        DEBUG_LEVEL = int(sys.argv[idx + 1])
-    except:
+    if idx + 1 < len(sys.argv):
+        try:
+            DEBUG_LEVEL = int(sys.argv[idx + 1])
+        except ValueError:
+            DEBUG_LEVEL = 1
+    else:
         DEBUG_LEVEL = 1
 
+DEBUG = DEBUG_LEVEL >= 1
+HEADFUL = DEBUG_LEVEL >= 3
 
 CPU_AVG_THRESHOLD = 30.0
 CPU_HIGH = 90.0
@@ -70,7 +75,7 @@ def log_cpu(sid, cpu):
     date = datetime.now().strftime("%Y-%m-%d")
     path = os.path.join(LOG_ROOT, sid)
     ensure_dir(path)
-    with open(os.path.join(path, f"{date}.log"), "a") as f:
+    with open(os.path.join(path, f"{date}.log"), "a", encoding="utf-8") as f:
         f.write(f"{datetime.now().isoformat()} {cpu}\n")
 
 def read_last_24h_avg(sid):
@@ -84,7 +89,7 @@ def read_last_24h_avg(sid):
     for fn in os.listdir(path):
         if not fn.endswith(".log"):
             continue
-        with open(os.path.join(path, fn)) as f:
+        with open(os.path.join(path, fn), encoding="utf-8") as f:
             for line in f:
                 try:
                     ts, cpu = line.split()
@@ -95,9 +100,7 @@ def read_last_24h_avg(sid):
                 except:
                     pass
 
-    if count == 0:
-        return None
-    return total / count
+    return total / count if count else None
 
 def alert(sid, reason):
     if sid in alerted:
@@ -122,9 +125,9 @@ def get_all_server_ids(page):
     page_no = 1
 
     while True:
-        print(f"[*] 扫描服务器列表 第 {page_no} 页")
+        if DEBUG:
+            print(f"[*] 扫描服务器列表 第 {page_no} 页")
 
-        # ===== 收集当前页 =====
         for r in page.query_selector_all("tr"):
             if not r.query_selector("span.badge-success"):
                 continue
@@ -132,28 +135,23 @@ def get_all_server_ids(page):
             if cb:
                 ids.add(cb.get_attribute("value"))
 
-        # ===== 找右翻页按钮 =====
         next_btn = page.query_selector(
             "ul.pagination li.page-item.c-pointer span.page-link:text-is('»')"
         )
 
-        # 没有下一页 or 被禁用 → 结束
         if not next_btn:
             break
 
         parent = next_btn.evaluate_handle("el => el.parentElement")
-        disabled = parent.get_attribute("class") or ""
-        if "disabled" in disabled:
+        if "disabled" in (parent.get_attribute("class") or ""):
             break
 
-        # 翻页
         next_btn.click()
         page_no += 1
         time.sleep(2)
 
     print(f"[+] 发现 Active 服务器: {len(ids)}")
     return list(ids)
-
 
 # ================= 抓 CPU =================
 def fetch_cpu(page, sid):
@@ -171,7 +169,10 @@ def main():
     ensure_dir(LOG_ROOT)
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=False if DEBUG_LEVEL >= 3 else True)
+        browser = pw.chromium.launch(
+            headless=not HEADFUL,
+            args=["--disable-gpu", "--no-sandbox"]
+        )
         ctx = browser.new_context()
         page = ctx.new_page()
 
@@ -185,6 +186,7 @@ def main():
             now = time.time()
 
             if now - last_success_ts > WATCHDOG_TIMEOUT:
+                print("[WATCHDOG] 重启浏览器")
                 browser.close()
                 return main()
 
@@ -210,20 +212,17 @@ def main():
 
                     log_cpu(sid, cpu)
 
-                    # ===== 规则 1：累计 ≥90% =====
                     if cpu >= CPU_HIGH:
                         cpu_90_accumulate[sid] = cpu_90_accumulate.get(sid, 0) + POLL_INTERVAL
                         if cpu_90_accumulate[sid] >= 3600:
                             alert(sid, "R1(累计90%≥1h)")
-                    # ===== 规则 2：连续 ≥90% =====
-                    if cpu >= CPU_HIGH:
+
                         cpu_90_continuous.setdefault(sid, now)
                         if now - cpu_90_continuous[sid] >= 3600:
                             alert(sid, "R2(连续90%≥1h)")
                     else:
                         cpu_90_continuous.pop(sid, None)
 
-                    # ===== 规则 3：24h 平均 =====
                     avg = read_last_24h_avg(sid)
                     if avg is not None and avg >= CPU_AVG_THRESHOLD:
                         alert(sid, "R3(24h平均≥30%)")
