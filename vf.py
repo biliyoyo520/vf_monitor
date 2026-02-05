@@ -1,13 +1,20 @@
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from playwright.sync_api import sync_playwright
 
-# ================= 参数 =================
-DEBUG = "--debug" in sys.argv
+# ================= Debug 参数 =================
+DEBUG_LEVEL = 0
+if "--debug" in sys.argv:
+    idx = sys.argv.index("--debug")
+    try:
+        DEBUG_LEVEL = int(sys.argv[idx + 1])
+    except:
+        DEBUG_LEVEL = 1
 
+# ================= 参数 =================
 CPU_PRINT_THRESHOLD = 30.0
 
 CPU_ALARM_THRESHOLD = 90.0
@@ -84,6 +91,12 @@ def color_cpu(cpu):
     else:
         return f"{cpu:6.2f}%"
 
+def get_24h_avg(sid):
+    samples = cpu_samples.get(sid, [])
+    if not samples:
+        return None
+    return sum(c for _, c in samples) / len(samples)
+
 # ================= 报警判定 =================
 def should_alarm(sid, cpu, now):
     global last_day
@@ -99,15 +112,14 @@ def should_alarm(sid, cpu, now):
     samples = cpu_samples.setdefault(sid, [])
     samples.append((now, cpu))
 
-    # 裁剪 24h 外的数据
     cutoff = now - 24 * 3600
     cpu_samples[sid] = [(t, c) for t, c in samples if t >= cutoff]
 
     # ===== 规则 1：当天累计 >=90% =====
     if cpu >= CPU_ALARM_THRESHOLD:
         daily_90_usage_sec[sid] = daily_90_usage_sec.get(sid, 0) + POLL_INTERVAL
-    if daily_90_usage_sec.get(sid, 0) >= CPU_DAILY_LIMIT_SEC:
-        return True, "当天累计跑满 CPU ≥ 1h"
+        if daily_90_usage_sec[sid] >= CPU_DAILY_LIMIT_SEC:
+            return True, "当天累计跑满 CPU ≥ 1h"
 
     # ===== 规则 2：连续 >=90% =====
     if cpu >= CPU_ALARM_THRESHOLD:
@@ -118,16 +130,16 @@ def should_alarm(sid, cpu, now):
         cpu_90_cont_since.pop(sid, None)
 
     # ===== 规则 3：前 24h 平均 =====
-    samples = cpu_samples[sid]
-    if samples:
-        avg = sum(c for _, c in samples) / len(samples)
-        if avg >= CPU_24H_AVG_THRESHOLD:
-            return True, f"前24h平均 CPU {avg:.1f}%"
+    avg = get_24h_avg(sid)
+    if avg is not None and avg >= CPU_24H_AVG_THRESHOLD:
+        return True, f"前24h平均 CPU {avg:.1f}%"
 
     return False, None
 
 def maybe_print(sid, cpu, alarm, reason):
     ts = datetime.now().strftime("%H:%M:%S")
+    avg = get_24h_avg(sid)
+
     if alarm:
         cnt = warn_count.get(sid, 0) + 1
         warn_count[sid] = cnt
@@ -135,8 +147,16 @@ def maybe_print(sid, cpu, alarm, reason):
             f"[{ts}] SID={sid} CPU={color_cpu(cpu)} "
             f"!!! 第{cnt}次警告 | {reason}"
         )
-    elif DEBUG:
-        print(f"[{ts}] SID={sid} CPU={color_cpu(cpu)}")
+        return
+
+    if DEBUG_LEVEL >= 1:
+        if DEBUG_LEVEL >= 2 and avg is not None:
+            print(
+                f"[{ts}] SID={sid} CPU={color_cpu(cpu)} "
+                f"| 24h_avg={avg:5.1f}%"
+            )
+        else:
+            print(f"[{ts}] SID={sid} CPU={color_cpu(cpu)}")
 
 # ================= 登录 / 抓取 =================
 def auto_login(page):
@@ -156,15 +176,18 @@ def get_all_server_ids(page):
             cb = r.query_selector("input.form-check-input")
             if cb:
                 ids.add(cb.get_attribute("value"))
+    print(f"[+] 发现 Active 服务器 {len(ids)} 台")
     return list(ids)
 
 def fetch_cpu(page):
+    global last_success_ts
     page.wait_for_selector("#cpuGauge text.value-text", timeout=15_000)
     txt = page.text_content("#cpuGauge text.value-text")
+    last_success_ts = time.time()
     return float(txt.replace("%", "").strip())
 
-# ================= 主循环 =================
-def main():
+# ================= 单次运行 =================
+def run_once():
     ensure_dir(LOG_ROOT)
 
     with sync_playwright() as pw:
@@ -182,8 +205,8 @@ def main():
             now = time.time()
 
             if now - last_success_ts > WATCHDOG_TIMEOUT:
-                browser.close()
-                return main()
+                print("[WATCHDOG] 超时，重启 Playwright")
+                break
 
             if now - last_refresh > SERVER_REFRESH_INTERVAL:
                 ids = get_all_server_ids(page)
@@ -209,6 +232,19 @@ def main():
                         p.close()
 
             time.sleep(POLL_INTERVAL)
+
+# ================= 主入口 =================
+def main():
+    while True:
+        try:
+            run_once()
+            time.sleep(5)
+        except KeyboardInterrupt:
+            print("\n[+] 正常退出")
+            break
+        except Exception as e:
+            print(f"[FATAL] {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
