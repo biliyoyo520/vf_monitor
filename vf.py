@@ -29,9 +29,9 @@ POLL_INTERVAL = 3
 SERVER_REFRESH_INTERVAL = 3600
 WATCHDOG_TIMEOUT = 120
 
-CPU_5MIN_WINDOW = 300  # 秒
+CPU_5MIN_WINDOW = 300
 
-# ================= Watchdog 异常 =================
+# ================= Watchdog =================
 class WatchdogRestart(Exception):
     pass
 
@@ -44,6 +44,33 @@ cpu_5min_samples = defaultdict(deque)
 last_5min_report = 0
 
 last_success_ts = time.time()
+
+# 进度条状态
+progress_done = 0
+progress_total = 0
+
+# ================= UI =================
+def clear_progress():
+    print("\r" + " " * 120 + "\r", end="", flush=True)
+
+def render_progress(done, total):
+    if total <= 0:
+        return
+    bar_len = 30
+    filled = int(bar_len * done / total)
+    bar = "█" * filled + "-" * (bar_len - filled)
+    print(f"\r[SCAN] |{bar}| {done}/{total}", end="", flush=True)
+
+def ui_print(msg):
+    clear_progress()
+    print(msg)
+    render_progress(progress_done, progress_total)
+
+def ui_print_lines(lines):
+    clear_progress()
+    for l in lines:
+        print(l)
+    render_progress(progress_done, progress_total)
 
 # ================= 密码 =================
 def input_password_masked(prompt="Password: "):
@@ -92,10 +119,8 @@ def read_last_24h_avg(sid):
     path = os.path.join(LOG_ROOT, sid)
     if not os.path.exists(path):
         return None
-
     cutoff = datetime.now() - timedelta(hours=24)
     total = count = 0
-
     for fn in os.listdir(path):
         if not fn.endswith(".log"):
             continue
@@ -103,31 +128,18 @@ def read_last_24h_avg(sid):
             for line in f:
                 try:
                     ts, cpu = line.split()
-                    ts = datetime.fromisoformat(ts)
-                    if ts >= cutoff:
+                    if datetime.fromisoformat(ts) >= cutoff:
                         total += float(cpu)
                         count += 1
                 except:
                     pass
-
     return total / count if count else None
 
 def alert(sid, reason):
     if sid in alerted:
         return
-    clear_progress()
     alerted.add(sid)
-    print(f"[ALERT] SID={sid} 命中规则: {reason}")
-
-# ================= 进度条 =================
-def render_progress(done, total):
-    bar_len = 30
-    filled = int(bar_len * done / total) if total else 0
-    bar = "█" * filled + "-" * (bar_len - filled)
-    print(f"\r[SCAN] |{bar}| {done}/{total}", end="", flush=True)
-
-def clear_progress():
-    print("\r" + " " * 100 + "\r", end="", flush=True)
+    ui_print(f"[ALERT] SID={sid} 命中规则: {reason}")
 
 # ================= 登录 =================
 def auto_login(page):
@@ -147,8 +159,7 @@ def get_all_server_ids(page):
 
     while True:
         if DEBUG:
-            clear_progress()
-            print(f"[*] 扫描服务器列表 第 {page_no} 页")
+            ui_print(f"[*] 扫描服务器列表 第 {page_no} 页")
 
         for r in page.query_selector_all("tr"):
             if not r.query_selector("span.badge-success"):
@@ -160,7 +171,6 @@ def get_all_server_ids(page):
         next_btn = page.query_selector(
             "ul.pagination li.page-item.c-pointer span.page-link:text-is('»')"
         )
-
         if not next_btn:
             break
 
@@ -172,12 +182,11 @@ def get_all_server_ids(page):
         page_no += 1
         time.sleep(2)
 
-    clear_progress()
-    print(f"[+] 发现 Active 服务器: {len(ids)}")
+    ui_print(f"[+] 发现 Active 服务器: {len(ids)}")
     return list(ids)
 
 # ================= 抓 CPU =================
-def fetch_cpu(page, sid):
+def fetch_cpu(page):
     global last_success_ts
     try:
         txt = page.text_content("#cpuGauge text.value-text")
@@ -189,7 +198,7 @@ def fetch_cpu(page, sid):
 
 # ================= 单次运行 =================
 def run_once(pw):
-    global last_5min_report
+    global last_5min_report, progress_done, progress_total
 
     browser = pw.chromium.launch(
         headless=not HEADFUL,
@@ -202,7 +211,7 @@ def run_once(pw):
     ids = get_all_server_ids(page)
     last_refresh = time.time()
 
-    print("[*] 开始监控")
+    ui_print("[*] 开始监控")
 
     while True:
         now = time.time()
@@ -215,8 +224,8 @@ def run_once(pw):
             ids = get_all_server_ids(page)
             last_refresh = now
 
-        scanned = 0
-        total = len(ids)
+        progress_done = 0
+        progress_total = len(ids)
 
         for i in range(0, len(ids), TAB_BATCH_SIZE):
             pages = {}
@@ -229,10 +238,11 @@ def run_once(pw):
                     p.close()
 
             for sid, p in pages.items():
-                cpu = fetch_cpu(p, sid)
+                cpu = fetch_cpu(p)
                 p.close()
-                scanned += 1
-                render_progress(scanned, total)
+
+                progress_done += 1
+                render_progress(progress_done, progress_total)
 
                 if cpu is None:
                     continue
@@ -246,12 +256,11 @@ def run_once(pw):
                     dq.popleft()
 
                 if DEBUG_LEVEL >= 1:
-                    clear_progress()
                     msg = f"[CPU] SID={sid} now={cpu:.1f}%"
                     if DEBUG_LEVEL >= 2:
                         avg = read_last_24h_avg(sid)
                         msg += f" | 24h_avg={avg:.1f}%" if avg else " | 24h_avg=N/A"
-                    print(msg)
+                    ui_print(msg)
 
                 if cpu >= CPU_HIGH:
                     cpu_90_accumulate[sid] = cpu_90_accumulate.get(sid, 0) + POLL_INTERVAL
@@ -270,27 +279,25 @@ def run_once(pw):
         # ===== 每 5 分钟 Top5 =====
         if time.time() - last_5min_report >= 300:
             last_5min_report = time.time()
-            clear_progress()
-
-            print("\n[STATS][5min] Top5 CPU:")
-            stats_5m = []
+            lines = ["[STATS][5min] Top5 CPU:"]
+            stats = []
             for sid, dq in cpu_5min_samples.items():
                 if dq:
-                    avg = sum(v for _, v in dq) / len(dq)
-                    stats_5m.append((avg, sid))
-            for avg, sid in sorted(stats_5m, reverse=True)[:5]:
-                print(f"  SID={sid} avg={avg:.1f}%")
+                    stats.append((sum(v for _, v in dq) / len(dq), sid))
+            for avg, sid in sorted(stats, reverse=True)[:5]:
+                lines.append(f"  SID={sid} avg={avg:.1f}%")
 
-            print("[STATS][24h] Top5 CPU:")
-            stats_24h = []
-            for sid in cpu_5min_samples.keys():
+            lines.append("[STATS][24h] Top5 CPU:")
+            stats = []
+            for sid in cpu_5min_samples:
                 avg = read_last_24h_avg(sid)
                 if avg is not None:
-                    stats_24h.append((avg, sid))
-            for avg, sid in sorted(stats_24h, reverse=True)[:5]:
-                print(f"  SID={sid} avg={avg:.1f}%")
+                    stats.append((avg, sid))
+            for avg, sid in sorted(stats, reverse=True)[:5]:
+                lines.append(f"  SID={sid} avg={avg:.1f}%")
 
-            print("-" * 40)
+            lines.append("-" * 40)
+            ui_print_lines(lines)
 
         time.sleep(POLL_INTERVAL)
 
@@ -302,8 +309,7 @@ def main():
             try:
                 run_once(pw)
             except WatchdogRestart:
-                clear_progress()
-                print("[WATCHDOG] 重启浏览器")
+                ui_print("[WATCHDOG] 重启浏览器")
 
 if __name__ == "__main__":
     main()
