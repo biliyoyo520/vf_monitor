@@ -249,29 +249,73 @@ class ServerPage(QtWidgets.QScrollArea):
 # 页面：历史
 # =========================
 
+class HistoryChart(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.values = []
+
+    def set_values(self, values):
+        self.values = values or []
+        self.update()
+
+    def paintEvent(self, e):
+        if len(self.values) < 2:
+            return
+
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+
+        rect = self.rect().adjusted(10, 10, -10, -10)
+        vmin = min(self.values)
+        vmax = max(self.values)
+        span = vmax - vmin or 1
+
+        points = []
+        for i, v in enumerate(self.values):
+            x = rect.left() + rect.width() * i / (len(self.values) - 1)
+            y = rect.bottom() - (v - vmin) / span * rect.height()
+            points.append(QtCore.QPointF(x, y))
+
+        p.setPen(QtGui.QPen(QtGui.QColor("#4ea3ff"), 2))
+        for a, b in zip(points, points[1:]):
+            p.drawLine(a, b)
+
+
 class HistoryPage(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         layout = QtWidgets.QVBoxLayout(self)
 
+        # 顶部栏（保持不变）
         top = QtWidgets.QHBoxLayout()
         self.server_label = QtWidgets.QLabel("Server")
         self.date_btn = QtWidgets.QPushButton("选择日期")
         top.addWidget(self.server_label)
         top.addStretch()
         top.addWidget(self.date_btn)
-
         layout.addLayout(top)
-        self.info = QtWidgets.QLabel("")
-        layout.addWidget(self.info)
-
+        
+        # 主区域：左右结构
+        main = QtWidgets.QHBoxLayout()
+        layout.addLayout(main)
+        
+        # 左：服务器列表
         self.list = QtWidgets.QListWidget()
         for sid in LogManager.servers():
             self.list.addItem(sid)
+        main.addWidget(self.list, 1)
+        
+        # 右：信息 + 图表
+        right = QtWidgets.QVBoxLayout()
+        main.addLayout(right, 3)
+        
+        self.info = QtWidgets.QLabel("")
+        right.addWidget(self.info)
+        
+        self.chart = HistoryChart()
+        self.chart.setMinimumHeight(220)
+        right.addWidget(self.chart)
 
-        layout.addWidget(self.list)
-
-        self.list.currentTextChanged.connect(self.load)
 
     def load(self, sid):
         self.server_label.setText(f"# {sid}  {today_date().isoformat()}")
