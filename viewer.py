@@ -1,31 +1,42 @@
 import os
-import re
 import sys
+import re
 import math
-import requests
 import datetime
 from statistics import mean
 from urllib.parse import urlparse
 
+import requests
 from qtpy import QtWidgets, QtCore, QtGui
 
-import matplotlib
-matplotlib.use("QtAgg")
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.figure import Figure
+# =========================
+# 基础设置 & 工具
+# =========================
+
+APP_NAME = "ServerMonitor"
+ORG_NAME = "LocalTools"
+
+
+def today_date():
+    try:
+        return datetime.date.today()
+    except Exception:
+        r = requests.get("https://worldtimeapi.org/api/ip", timeout=3)
+        return datetime.datetime.fromisoformat(r.json()["datetime"]).date()
 
 
 # =========================
-# 工具 & 管理类
+# 设置管理（QSettings）
 # =========================
 
 class SettingsManager(QtCore.QObject):
-    settings_changed = QtCore.Signal()
+    changed = QtCore.Signal()
 
     def __init__(self):
         super().__init__()
-        self.vf_url = ""
-        self.theme = "auto"  # auto | dark | light
+        self.qs = QtCore.QSettings(ORG_NAME, APP_NAME)
+        self.vf_url = self.qs.value("vf_url", "", str)
+        self.theme = self.qs.value("theme", "auto", str)
 
     def normalize_url(self, text: str):
         text = text.strip()
@@ -36,10 +47,10 @@ class SettingsManager(QtCore.QObject):
             text = "https://" + text
 
         try:
-            parsed = urlparse(text)
-            if not parsed.netloc:
+            p = urlparse(text)
+            if not p.netloc:
                 return "", False
-            clean = f"{parsed.scheme}://{parsed.netloc}"
+            clean = f"{p.scheme}://{p.netloc}"
             return clean, clean != text
         except Exception:
             return "", False
@@ -47,42 +58,41 @@ class SettingsManager(QtCore.QObject):
     def save(self, url, theme):
         self.vf_url = url
         self.theme = theme
-        self.settings_changed.emit()
+        self.qs.setValue("vf_url", url)
+        self.qs.setValue("theme", theme)
+        self.changed.emit()
 
+
+# =========================
+# 日志管理 + 24h 补齐
+# =========================
 
 class LogManager:
     BASE = "./logs"
 
     @staticmethod
-    def get_today():
-        try:
-            return datetime.date.today()
-        except Exception:
-            r = requests.get("https://worldtimeapi.org/api/ip")
-            ts = datetime.datetime.fromisoformat(r.json()["datetime"])
-            return ts.date()
-
-    @staticmethod
-    def list_servers():
+    def servers():
         if not os.path.isdir(LogManager.BASE):
             return []
-        return sorted([d for d in os.listdir(LogManager.BASE) if d.isdigit()],
-                      key=lambda x: int(x))
+        return sorted(
+            [d for d in os.listdir(LogManager.BASE) if d.isdigit()],
+            key=lambda x: int(x)
+        )
 
     @staticmethod
-    def list_dates(server_id):
-        path = os.path.join(LogManager.BASE, server_id)
-        if not os.path.isdir(path):
+    def dates(server_id):
+        p = os.path.join(LogManager.BASE, server_id)
+        if not os.path.isdir(p):
             return []
-        return sorted([f[:-4] for f in os.listdir(path) if f.endswith(".log")])
+        return sorted(f[:-4] for f in os.listdir(p) if f.endswith(".log"))
 
     @staticmethod
-    def read_log(server_id, date_str):
+    def read(server_id, date_str):
         path = os.path.join(LogManager.BASE, server_id, f"{date_str}.log")
         if not os.path.isfile(path):
             return []
 
-        data = []
+        out = []
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -90,47 +100,124 @@ class LogManager:
                     continue
                 try:
                     ts, val = line.split()
-                    data.append((datetime.datetime.fromisoformat(ts), float(val)))
+                    out.append((datetime.datetime.fromisoformat(ts), float(val)))
                 except Exception:
                     pass
-        return data
+        return out
+
+    @staticmethod
+    def read_last_24h(server_id):
+        now = datetime.datetime.now()
+        today = now.date()
+        yesterday = today - datetime.timedelta(days=1)
+
+        data = []
+        for d in (yesterday, today):
+            data.extend(LogManager.read(server_id, d.isoformat()))
+
+        cutoff = now - datetime.timedelta(hours=24, minutes=5)
+        return [(t, v) for t, v in data if t >= cutoff and t <= now]
 
 
 # =========================
-# 折线图
+# 仪表盘（油门表）
 # =========================
 
-class HistoryChart(FigureCanvasQTAgg):
+class GaugeWidget(QtWidgets.QWidget):
     def __init__(self):
-        self.fig = Figure(figsize=(6, 4), dpi=100)
-        super().__init__(self.fig)
-        self.ax = self.fig.add_subplot(111)
+        super().__init__()
+        self.value = 0
 
-    def draw_data(self, data):
-        self.ax.clear()
+    def set_value(self, v):
+        self.value = max(0, min(100, v))
+        self.update()
+
+    def paintEvent(self, e):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+
+        rect = self.rect().adjusted(10, 10, -10, -10)
+        start_angle = 225 * 16
+        span = int(-270 * 16 * (self.value / 100))
+
+        if self.value < 50:
+            color = QtGui.QColor("#3cb371")
+        elif self.value < 85:
+            color = QtGui.QColor("#f0ad4e")
+        else:
+            color = QtGui.QColor("#d9534f")
+
+        pen_bg = QtGui.QPen(QtGui.QColor("#333"), 12)
+        pen_fg = QtGui.QPen(color, 12)
+
+        p.setPen(pen_bg)
+        p.drawArc(rect, 225 * 16, -270 * 16)
+
+        p.setPen(pen_fg)
+        p.drawArc(rect, start_angle, span)
+
+        p.setPen(QtGui.QColor("white"))
+        f = p.font()
+        f.setPointSize(14)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(self.rect(), QtCore.Qt.AlignCenter, f"{int(self.value)}%")
+
+
+# =========================
+# 服务器卡片
+# =========================
+
+class ServerCard(QtWidgets.QFrame):
+    def __init__(self, server_id, settings: SettingsManager):
+        super().__init__()
+        self.server_id = server_id
+        self.settings = settings
+
+        self.setFrameShape(QtWidgets.QFrame.StyledPanel)
+
+        layout = QtWidgets.QHBoxLayout(self)
+
+        self.gauge = GaugeWidget()
+        self.gauge.setFixedSize(120, 120)
+
+        right = QtWidgets.QVBoxLayout()
+        self.title = QtWidgets.QLabel(f"# {server_id}")
+        self.stats = QtWidgets.QLabel("")
+
+        self.title.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.title.mousePressEvent = self.open_panel
+
+        right.addWidget(self.title)
+        right.addWidget(self.stats)
+        right.addStretch()
+
+        layout.addWidget(self.gauge)
+        layout.addLayout(right)
+
+        self.refresh()
+
+    def open_panel(self, _):
+        if not self.settings.vf_url:
+            return
+        QtGui.QDesktopServices.openUrl(
+            QtCore.QUrl(f"{self.settings.vf_url}/admin/servers/{self.server_id}")
+        )
+
+    def refresh(self):
+        data = LogManager.read(self.server_id, today_date().isoformat())
         if not data:
-            self.draw()
+            self.stats.setText("Error")
+            self.gauge.set_value(0)
             return
 
-        times = [t for t, _ in data]
         values = [v for _, v in data]
-
-        def color_for(v):
-            if v < 50:
-                return "green"
-            elif v < 85:
-                return "orange"
-            return "red"
-
-        for i in range(len(values) - 1):
-            x = times[i:i+2]
-            y = values[i:i+2]
-            self.ax.plot(x, y, color=color_for(mean(y)))
-
-        self.ax.set_ylabel("CPU %")
-        self.ax.grid(True, alpha=0.3)
-        self.fig.autofmt_xdate()
-        self.draw()
+        self.gauge.set_value(values[-1])
+        self.stats.setText(
+            f"Max {max(values):.1f}%\n"
+            f"Min {min(values):.1f}%\n"
+            f"Avg {mean(values):.1f}%"
+        )
 
 
 # =========================
@@ -138,46 +225,24 @@ class HistoryChart(FigureCanvasQTAgg):
 # =========================
 
 class ServerPage(QtWidgets.QScrollArea):
-    def __init__(self, settings: SettingsManager):
+    def __init__(self, settings):
         super().__init__()
         self.settings = settings
-        self.widget = QtWidgets.QWidget()
-        self.setWidget(self.widget)
+        self.container = QtWidgets.QWidget()
+        self.setWidget(self.container)
         self.setWidgetResizable(True)
-        self.layout = QtWidgets.QGridLayout(self.widget)
-        self.refresh()
 
-    def refresh(self):
-        while self.layout.count():
-            self.layout.takeAt(0).widget().deleteLater()
+        self.grid = QtWidgets.QGridLayout(self.container)
+        self.cards = {}
 
-        today = LogManager.get_today().isoformat()
-        servers = LogManager.list_servers()
+        self.load()
 
+    def load(self):
+        servers = LogManager.servers()
         for i, sid in enumerate(servers):
-            data = LogManager.read_log(sid, today)
-            if not data:
-                text = f"# {sid}\nError"
-            else:
-                values = [v for _, v in data]
-                text = (
-                    f"# {sid}\n"
-                    f"最新 {values[-1]:.1f}%\n"
-                    f"avg {mean(values):.1f}%\n"
-                    f"max {max(values):.1f}%\n"
-                    f"min {min(values):.1f}%"
-                )
-
-            btn = QtWidgets.QPushButton(text)
-            btn.clicked.connect(lambda _, x=sid: self.open_server(x))
-            self.layout.addWidget(btn, i // 2, i % 2)
-
-    def open_server(self, sid):
-        if not self.settings.vf_url:
-            return
-        QtGui.QDesktopServices.openUrl(
-            QtCore.QUrl(f"{self.settings.vf_url}/admin/servers/{sid}")
-        )
+            card = ServerCard(sid, self.settings)
+            self.cards[sid] = card
+            self.grid.addWidget(card, i // 2, i % 2)
 
 
 # =========================
@@ -187,38 +252,54 @@ class ServerPage(QtWidgets.QScrollArea):
 class HistoryPage(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        layout = QtWidgets.QHBoxLayout(self)
+        layout = QtWidgets.QVBoxLayout(self)
+
+        top = QtWidgets.QHBoxLayout()
+        self.server_label = QtWidgets.QLabel("Server")
+        self.date_btn = QtWidgets.QPushButton("选择日期")
+        top.addWidget(self.server_label)
+        top.addStretch()
+        top.addWidget(self.date_btn)
+
+        layout.addLayout(top)
+        self.info = QtWidgets.QLabel("")
+        layout.addWidget(self.info)
 
         self.list = QtWidgets.QListWidget()
-        self.chart = HistoryChart()
-        self.info = QtWidgets.QLabel()
-
-        right = QtWidgets.QVBoxLayout()
-        right.addWidget(self.chart)
-        right.addWidget(self.info)
-
-        layout.addWidget(self.list, 1)
-        layout.addLayout(right, 4)
-
-        for sid in LogManager.list_servers():
+        for sid in LogManager.servers():
             self.list.addItem(sid)
+
+        layout.addWidget(self.list)
 
         self.list.currentTextChanged.connect(self.load)
 
     def load(self, sid):
-        today = LogManager.get_today().isoformat()
-        data = LogManager.read_log(sid, today)
-        self.chart.draw_data(data)
+        self.server_label.setText(f"# {sid}  {today_date().isoformat()}")
 
-        if data:
-            values = [v for _, v in data]
-            self.info.setText(
-                f"[Today] max {max(values):.1f}%  "
-                f"min {min(values):.1f}%  "
-                f"avg {mean(values):.1f}%"
-            )
-        else:
+        data = LogManager.read(sid, today_date().isoformat())
+        if not data:
             self.info.setText("No data")
+            return
+
+        values = [v for _, v in data]
+        text = (
+            f"[Today] "
+            f"Max {max(values):.1f}%  "
+            f"Min {min(values):.1f}%  "
+            f"Avg {mean(values):.1f}%"
+        )
+
+        data24 = LogManager.read_last_24h(sid)
+        if data24:
+            v24 = [v for _, v in data24]
+            text += (
+                f"\n[24h] "
+                f"Max {max(v24):.1f}%  "
+                f"Min {min(v24):.1f}%  "
+                f"Avg {mean(v24):.1f}%"
+            )
+
+        self.info.setText(text)
 
 
 # =========================
@@ -231,12 +312,12 @@ class SettingsPage(QtWidgets.QWidget):
         self.settings = settings
 
         layout = QtWidgets.QFormLayout(self)
-
-        self.url = QtWidgets.QLineEdit()
+        self.url = QtWidgets.QLineEdit(settings.vf_url)
         self.url.setPlaceholderText("https://serv.example.com")
 
         self.theme = QtWidgets.QComboBox()
         self.theme.addItems(["auto", "dark", "light"])
+        self.theme.setCurrentText(settings.theme)
 
         save = QtWidgets.QPushButton("保存")
 
@@ -247,7 +328,7 @@ class SettingsPage(QtWidgets.QWidget):
         save.clicked.connect(self.save)
 
     def save(self):
-        clean, changed = self.settings.normalize_url(self.url.text())
+        clean, _ = self.settings.normalize_url(self.url.text())
         if not clean:
             QtWidgets.QMessageBox.warning(self, "错误", "非法 URL")
             return
@@ -262,9 +343,8 @@ class SettingsPage(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Server Monitor")
-
         self.settings = SettingsManager()
+        self.setWindowTitle("Server Monitor")
 
         tabs = QtWidgets.QTabWidget()
         tabs.addTab(ServerPage(self.settings), "服务器")
@@ -272,7 +352,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(SettingsPage(self.settings), "设置")
 
         self.setCentralWidget(tabs)
-        self.resize(1100, 700)
+        self.resize(1100, 720)
 
 
 # =========================
