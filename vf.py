@@ -285,7 +285,7 @@ def run_once(pw):
                 if dq:
                     stats.append((sum(v for _, v in dq) / len(dq), sid))
             for avg, sid in sorted(stats, reverse=True)[:5]:
-                lines.append(f"  SID={sid} avg={avg:.1f}%")
+                lines.append(f"  SID={sid} high={avg:.1f}%")
 
             lines.append("[STATS][24h] Top5 CPU:")
             stats = []
