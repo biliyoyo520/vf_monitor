@@ -7,6 +7,10 @@ from collections import deque, defaultdict
 from playwright.sync_api import sync_playwright
 
 # ================= 参数 =================
+
+# 这里写 Virtfusion 面板访问地址 仅在 Virtfusion 6.2.0 测试通过
+BASE_URL = "https://vf.ciallo.ee"
+
 DEBUG_LEVEL = 0
 if "--debug" in sys.argv:
     idx = sys.argv.index("--debug")
@@ -100,7 +104,6 @@ def input_password_masked(prompt="Password: "):
 VF_EMAIL = input("VirtFusion Email: ")
 VF_PASSWORD = input_password_masked("VirtFusion Password: ")
 
-BASE_URL = "https://vf.ciallo.ee"
 SERVERS_URL = f"{BASE_URL}/admin/servers"
 LOG_ROOT = "logs"
 
