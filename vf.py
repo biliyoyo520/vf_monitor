@@ -25,7 +25,7 @@ if "--debug" in sys.argv:
 DEBUG = DEBUG_LEVEL >= 1
 HEADFUL = DEBUG_LEVEL >= 3
 
-CPU_AVG_THRESHOLD = 30.0
+CPU_AVG_THRESHOLD = 60.0
 CPU_HIGH = 90.0
 
 TAB_BATCH_SIZE = 5
@@ -147,6 +147,9 @@ def alert(sid, reason):
 # ================= 登录 =================
 def auto_login(page):
     page.goto(BASE_URL)
+    # 如果已经不在登录页，说明已登录则直接返回
+    if "/login" not in page.url:
+        return
     page.fill("input[type='email']", VF_EMAIL)
     page.fill("input[type='password']", VF_PASSWORD)
     page.click("button.btn-primary")
@@ -277,7 +280,7 @@ def run_once(pw):
 
                 avg = read_last_24h_avg(sid)
                 if avg is not None and avg >= CPU_AVG_THRESHOLD:
-                    alert(sid, "R3(24h平均≥30%)")
+                    alert(sid, "R3(24h平均≥60%)")
 
         # ===== 每 5 分钟 Top5 =====
         if time.time() - last_5min_report >= 300:
