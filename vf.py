@@ -101,8 +101,13 @@ def input_password_masked(prompt="Password: "):
     return pwd
 
 # ================= 登录信息 =================
-VF_EMAIL = input("VirtFusion Email: ")
-VF_PASSWORD = input_password_masked("VirtFusion Password: ")
+# 优先使用环境变量，以便外部脚本可以在不触发交互提示的情况下提供凭据
+VF_EMAIL = os.environ.get("VF_EMAIL")
+VF_PASSWORD = os.environ.get("VF_PASSWORD")
+if VF_EMAIL is None:
+    VF_EMAIL = input("VirtFusion Email: ")
+if VF_PASSWORD is None:
+    VF_PASSWORD = input_password_masked("VirtFusion Password: ")
 
 SERVERS_URL = f"{BASE_URL}/admin/servers"
 LOG_ROOT = "logs"
