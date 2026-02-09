@@ -44,13 +44,14 @@ def run_once(email, pwd):
     return proc.returncode
 
 def main():
-    print("Launcher: 启动 vf.py，崩溃后会重新启动并重新输入凭据。按 Ctrl+C 退出。")
+    print("Launcher: 启动 vf.py，崩溃后会重新启动并保留凭据。按 Ctrl+C 退出。")
     try:
+        # 首次询问凭据，之后在内存中持久化，重启时不会重新提示
+        email, pwd = prompt_credentials()
         while True:
-            email, pwd = prompt_credentials()
             print("Starting vf.py...")
             rc = run_once(email, pwd)
-            print(f"vf.py exited with code {rc}. Restarting and re-prompting credentials...")
+            print(f"vf.py exited with code {rc}. Restarting with same credentials...")
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nLauncher: 已退出。")
