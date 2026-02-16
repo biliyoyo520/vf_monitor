@@ -315,12 +315,26 @@ def run_once(pw):
 # ================= 主入口 =================
 def main():
     ensure_dir(LOG_ROOT)
+    # 当 Watchdog 重启多次无效时退出，避免无限重启循环
+    max_restarts = 3
+    restart_count = 0
     with sync_playwright() as pw:
         while True:
             try:
                 run_once(pw)
+                # 如果 run_once 正常返回（理论上不常见），重置重启计数
+                restart_count = 0
             except WatchdogRestart:
-                ui_print("[WATCHDOG] 重启浏览器")
+                restart_count += 1
+                ui_print(f"[WATCHDOG] 重启浏览器 ({restart_count}/{max_restarts})")
+                if restart_count >= max_restarts:
+                    ui_print("[WATCHDOG] 超过最大重启次数，程序退出")
+                    sys.exit(1)
+                # 否则继续循环以重启
+            except Exception as e:
+                # 未预期的异常，打印并重新抛出以便外部或 supervisor 处理
+                ui_print(f"[ERROR] 未处理异常: {e}")
+                raise
 
 if __name__ == "__main__":
     main()
